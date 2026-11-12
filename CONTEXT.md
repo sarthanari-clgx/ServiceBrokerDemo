@@ -58,7 +58,7 @@ mindmap
 | 2 | Database-level switch enabled: `ALTER DATABASE <db> SET ENABLE_BROKER` (`sys.databases.is_broker_enabled = 1`) | Enabled on the new demo DB                                 |
 | 3 | A unique `service_broker_guid` per database                                                                      | Met (copies of a DB need `SET NEW_BROKER`)               |
 | 4 | Permissions to create broker objects (`db_owner` or `CONTROL` on the DB)                                       | Met                                                        |
-| 5 | Endpoint (`CREATE ENDPOINT ... FOR SERVICE_BROKER`)                                                              | Not needed. Only required for messaging between instances. |
+| 5 | Endpoint (`CREATE ENDPOINT ... FOR SERVICE_BROKER`)                                                              | Not needed for the single-DB demo (see section 10). Required only for messaging between instances. |
 | 6 | Activation procedure runs under a valid principal (`EXECUTE AS OWNER` here)                                      | Met                                                        |
 
 State found on the server before the demo:
@@ -76,21 +76,21 @@ No `SERVICE_BROKER` endpoint existed. Existing databases were not touched.
 
 | Change                                                                           | Where                         | Notes                                                           |
 | -------------------------------------------------------------------------------- | ----------------------------- | --------------------------------------------------------------- |
-| Created database `ServiceBrokerDemo` with broker enabled                       | Local SQL Server              | The only server-side change. Removable with `04_cleanup.sql`. |
+| Created database `ServiceBrokerDemo` with broker enabled                       | Local SQL Server              | Removable with `04_cleanup.sql`. |
 | Created message types, contract, 2 queues, 2 services, `ProcessedOrders` table | `ServiceBrokerDemo`         | [01_setup.sql](01_setup.sql)                                     |
 | Created 2 activation procedures and attached them to the queues                  | `ServiceBrokerDemo`         | [03_activation.sql](03_activation.sql)                           |
 | Created demo scripts and runner                                                  | `c:\code\ServiceBrokerDemo` | See below                                                       |
 | Temporary `Orders` table and trigger, used to verify section 6, then dropped   | `ServiceBrokerDemo`         | Nothing left behind                                             |
 
-No instance configuration, endpoints, logins or other databases were modified.
+The two-database demo (section 10) later added the databases `SB_Sender` and `SB_Receiver` and a loopback-only `BrokerDemoEndpoint` on port 4022. No logins, instance settings or other databases were modified.
 
 | File                                    | Purpose                                                  |
 | --------------------------------------- | -------------------------------------------------------- |
 | [01_setup.sql](01_setup.sql)             | Create DB, enable broker, create all broker objects      |
 | [02_manual_flow.sql](02_manual_flow.sql) | One request/reply round trip done by hand                |
 | [03_activation.sql](03_activation.sql)   | Automatic processing via internal activation, 5 messages |
-| [04_cleanup.sql](04_cleanup.sql)         | Drop the demo DB                                         |
-| [run-demo.ps1](run-demo.ps1)             | Runs 01 to 03 (`-Cleanup` runs 04)                     |
+| [04_cleanup.sql](04_cleanup.sql)         | Drop all demo databases and the endpoint                                         |
+| [run-demo.ps1](run-demo.ps1)             | Runs 01 to 03; `-TwoDb` runs 05 and 06; `-Endpoint` runs 07; `-Cleanup` runs 04                     |
 
 Gotcha found while building: `sqlcmd` defaults to `QUOTED_IDENTIFIER OFF`, which makes XML methods such as `.value()` fail with error 1934. Use `sqlcmd -I`, as the runner does.
 
@@ -304,8 +304,10 @@ The trigger does a set-based insert; for multi-row `inserted`, the message conta
 
 ```powershell
 cd c:\code\ServiceBrokerDemo
-.\run-demo.ps1            # setup + manual flow + activation
-.\run-demo.ps1 -Cleanup   # drop the demo database
+.\run-demo.ps1            # setup + manual flow + activation (single database)
+.\run-demo.ps1 -TwoDb      # sender and receiver in separate databases
+.\run-demo.ps1 -Endpoint   # route the two-database demo through a TCP endpoint
+.\run-demo.ps1 -Cleanup    # drop all demo databases and the endpoint
 ```
 
 Expected: `02_manual_flow.sql` shows the request, reply and `EndDialog` messages, and `ProcessedOrders` has `manual` and `activation` rows (orders 1001 and 2001 to 2005).
@@ -339,7 +341,169 @@ Common pitfalls:
 - A disabled queue (poison message) stops all processing silently, so monitor `is_receive_enabled`.
 - A broker-enabled database with a duplicate `service_broker_guid` (from a restore on the same instance) cannot be enabled without `NEW_BROKER`.
 
-## 10. References
+## 10. Two databases and the endpoint concept
+
+### 10.1 What was added
+
+| File | Purpose |
+|---|---|
+| [05_twodb_setup.sql](05_twodb_setup.sql) | Recreates `SB_Sender` (initiator service, queue, `SendOrder` procedure, `Replies` table) and `SB_Receiver` (target service, queue, activated processor, `ProcessedOrders` table) |
+| [06_twodb_run.sql](06_twodb_run.sql) | Sends orders 5001 to 5003 from the sender and shows results in both databases, the route used, and the transmission queue |
+| [07_endpoint_demo.sql](07_endpoint_demo.sql) | Creates a loopback-only Service Broker endpoint and routes, then sends orders 6001 and 6002 over TCP |
+
+Each database has its own copy of the message types and contract; they only need matching names. Service names use `//TwoDb/` so they do not collide with the single-database demo.
+
+```mermaid
+flowchart LR
+    subgraph Instance["One SQL Server instance"]
+        subgraph S["SB_Sender"]
+            SP["dbo.SendOrder<br/>INSERT OutgoingOrders + SEND"] --> SQ[("SenderQueue<br/>//TwoDb/SenderService")]
+            SQ --> SA["ProcessSenderQueue<br/>INSERT Replies"]
+        end
+        subgraph R["SB_Receiver"]
+            RQ[("ReceiverQueue<br/>//TwoDb/ReceiverService")] --> RA["ProcessReceiverQueue<br/>INSERT ProcessedOrders"]
+        end
+        SP == "06: AutoCreatedLocal (no endpoint)" ==> RQ
+        RA == "reply" ==> SQ
+        EP(("Endpoint<br/>TCP 127.0.0.1:4022"))
+        SP -. "07: route ReceiverViaTcp" .-> EP -.-> RQ
+    end
+```
+
+Results observed:
+
+- Script 06: orders 5001 to 5003 were processed in `SB_Receiver` and the replies were stored in `SB_Sender.Replies`. The sender's only route was `AutoCreatedLocal` (`LOCAL`) and `sys.transmission_queue` was empty.
+- Script 07: orders 6001 and 6002 were processed. `sys.dm_broker_connections` showed two connections (`LOGGED IN`, `ONLINE`, AES) with bytes sent and received, which proves the traffic used the endpoint.
+
+### 10.2 The endpoint concept
+
+An **endpoint** is an instance-level network listener. A Service Broker endpoint (`CREATE ENDPOINT ... FOR SERVICE_BROKER`) accepts TCP connections from other SQL Server instances and hands incoming messages to the right database and queue. It is separate from the normal SQL port 1433, and an instance can have only one Service Broker endpoint.
+
+```mermaid
+mindmap
+  root((Endpoint))
+    Instance level
+      One per instance
+      TCP listener e.g. 4022
+      Separate from port 1433
+    Settings
+      AUTHENTICATION: WINDOWS or CERTIFICATE
+      ENCRYPTION: REQUIRED with AES
+      MESSAGE_FORWARDING
+      LISTENER_IP
+    Permissions
+      GRANT CONNECT ON ENDPOINT
+      Login of the calling instance
+    Works with
+      ROUTE
+        Address book per database
+        SERVICE_NAME to TCP address
+      Dialog security
+        End to end protection
+        Certificates and remote service bindings
+```
+
+Three things are easy to confuse:
+
+| Concept | Scope | Question it answers | Example from this demo |
+|---|---|---|---|
+| **Endpoint** | Instance | Where do I listen for incoming broker traffic, and who may connect? | `BrokerDemoEndpoint` on `127.0.0.1:4022` |
+| **Route** | Database | Where do I send messages for service X? | `ReceiverViaTcp`: `//TwoDb/ReceiverService` to `TCP://127.0.0.1:4022` |
+| **Service** | Database | What is the named address of a queue? | `//TwoDb/ReceiverService` |
+
+When an endpoint and route are needed:
+
+| Scenario | Endpoint | Route | Security needed |
+|---|---|---|---|
+| Same database | No | Built-in `AutoCreatedLocal` | None |
+| Different databases, same instance (script 06) | No | Built-in `AutoCreatedLocal` | Anonymous dialog: `guest` connects to the target DB and `public` may SEND on the target service |
+| Different instances or servers | Yes, on both | Explicit route in each direction | `CONNECT` on the endpoint, firewall port open, optional dialog security |
+
+How a message finds its destination:
+
+```mermaid
+flowchart TD
+    A["BEGIN DIALOG ... TO SERVICE X"] --> B{"Route for X in the sender database?"}
+    B -- "Only AutoCreatedLocal (ADDRESS = LOCAL)" --> C["Look for service X in databases of this instance"]
+    C --> D["Enqueue directly on the target queue"]
+    B -- "ROUTE with ADDRESS = TCP://host:port" --> E["Message waits in sys.transmission_queue"]
+    E --> F["Open connection to the remote endpoint and authenticate"]
+    F --> G["Remote endpoint finds service X in its databases"]
+    G --> D
+```
+
+A route that names the service beats the wildcard `AutoCreatedLocal` route, which is why adding `ReceiverViaTcp` switches delivery to TCP. Replies need a route back to the initiator's service, so routes are needed in both directions. Messages that cannot be delivered stay in `sys.transmission_queue`, with the reason in `transmission_status`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as SB_Sender
+    participant TQ as sys.transmission_queue
+    participant EP as Endpoint 4022
+    participant Rcv as SB_Receiver
+    App->>TQ: SEND (route ReceiverViaTcp)
+    TQ->>EP: Connect, authenticate (Windows), encrypt (AES)
+    EP->>Rcv: Enqueue on ReceiverQueue
+    Rcv->>Rcv: Activated procedure processes the order
+    Rcv->>EP: Reply (route SenderViaTcp)
+    EP->>App: Enqueue on SenderQueue
+```
+
+Real two-server layout, for reference:
+
+```mermaid
+flowchart LR
+    subgraph A["Server A"]
+        DA[("Sender DB<br/>route: Receiver to TCP://serverB:4022")] --- EA(("Endpoint 4022"))
+    end
+    subgraph B["Server B"]
+        EB(("Endpoint 4022")) --- DB2[("Receiver DB<br/>route: Sender to TCP://serverA:4022")]
+    end
+    EA <== "TCP, Windows or certificate auth, AES" ==> EB
+```
+
+### 10.3 Comic strip: the post office
+
+```text
++-----------------------+-----------------------+-----------------------+
+| PANEL 1               | PANEL 2               | PANEL 3               |
+|                       |                       |                       |
+|  SENDER DB: "Letter   |  ROUTE (address book):|  ENDPOINT (mail room  |
+|  for service X!"      |  "X lives at          |  door): "Badge please. |
+|                       |   TCP://serverB:4022" |  CONNECT granted?     |
+|  [letter]  --->       |                       |  Come in, X is in     |
+|                       |   Same building?      |  the Receiver DB."    |
+|                       |   LOCAL: no door.     |                       |
++-----------------------+-----------------------+-----------------------+
+```
+
+### 10.4 Lesson from building it: crossing a database boundary is a security boundary
+
+The first run of script 06 sent the messages but nothing arrived. They sat in `SB_Sender.sys.transmission_queue` with this status:
+
+```text
+Error: 916, State: 3. The server principal "ISC\sarthanari" is not able to access the database
+"SB_Receiver" under the current security context.
+```
+
+The sender used `ENCRYPTION = OFF`, so the dialog is anonymous and arrives in the target database as `guest`/`public`. The fix, in `05_twodb_setup.sql` for the receiver and in `07_endpoint_demo.sql` for the sender's reply service, is:
+
+```sql
+GRANT CONNECT TO guest;
+GRANT SEND ON SERVICE::[//TwoDb/ReceiverService] TO [public];
+```
+
+This is acceptable for a throwaway demo. In production, prefer dialog security with certificates and remote service bindings, or a dedicated user with `SEND` permission, instead of opening the service to `public`. Diagnose stuck messages with:
+
+```sql
+SELECT to_service_name, transmission_status FROM sys.transmission_queue;
+```
+
+### 10.5 Cleanup and exposure
+
+The endpoint listens on `127.0.0.1` only, so it is not reachable from other machines. It is still running after the demo. `.\run-demo.ps1 -Cleanup` drops it, together with `SB_Sender`, `SB_Receiver` and `ServiceBrokerDemo`.
+
+## 11. References
 
 - Microsoft Learn: SQL Server Service Broker documentation
 - `sys.databases`, `sys.service_queues`, `sys.conversation_endpoints`, `sys.dm_broker_activated_tasks`
